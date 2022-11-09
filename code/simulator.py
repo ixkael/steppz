@@ -23,29 +23,32 @@ class CatalogSimulator:
         self, n_steps, prior_hyperparameters, datamodel_hyperparameters
     ):
         # sample parameters from prior
-        def log_prob(parameters, *args):
+        def log_prob(latentparameters_phi, *args):
             # annoying that the model magnitudes need to be calculated twice...
             # could probably change the structure a little bit to avoid that?
-            prior_lnp = self.sps_prior.log_prob(parameters, *args)
-            model_magnitudes = self.flux_models.magnitudes(self.transform(parameters[..., 1:]), parameters[..., 0])
-            return prior_lnp + self.additional_prior(parameters, model_magnitudes)
+            prior_lnp = self.sps_prior.log_prob(latentparameters_phi, *args)
+            theta = self.sps_prior.bijector.forward(latentparameters_phi)
+            model_magnitudes = self.flux_models.magnitudes(self.transform(theta[..., 1:]), theta[..., 0])
+            return prior_lnp + self.additional_prior(latentparameters_phi, model_magnitudes)
 
-        parameters = affine_sample(
+        latentparameters_phi = affine_sample(
             log_prob, n_steps, self.current_state, args=prior_hyperparameters, progressbar=False
         )
         # Update state
         self.current_state = [
-            parameters[-1, 0:self.n_walkers,:],
-            parameters[-1, self.n_walkers:2*self.n_walkers, :]
+            latentparameters_phi[-1, 0:self.n_walkers,:],
+            latentparameters_phi[-1, self.n_walkers:2*self.n_walkers, :]
         ]
 
-        model_fluxes = self.flux_models.fluxes(self.transform(parameters[..., 1:]), parameters[..., 0])
+        theta = sps_prior.bijector.forward(latentparameters_phi)
+        model_mags = self.flux_models.magnitudes(self.transform(theta[..., 1:]), theta[..., 0])
         # TODO: not reshape, and keep separation between walkers?
-        parameters = parameters.numpy().reshape(-1, parameters.shape[-1])
-        model_fluxes = model_fluxes.numpy().reshape(-1, model_fluxes.shape[-1])
+        theta = theta.numpy().reshape(-1, theta.shape[-1])
+        latentparameters_phi = latentparameters_phi.numpy().reshape(-1, theta.shape[-1])
+        model_mags = model_mags.numpy().reshape(-1, model_mags.shape[-1])
         # use data model to generate and add noise, apply zeropoints
         corrected_noisy_fluxes, corrected_flux_sigmas = self.data_model(
-            model_fluxes, datamodel_hyperparameters
+            model_mags, datamodel_hyperparameters
         )
         # use selection model to figure out which galaxies are kept
         selected = self.selection_model(
@@ -53,7 +56,7 @@ class CatalogSimulator:
         )
         # return selected objects (if any!)
         n_kept = np.sum(selected)
-        return n_kept, parameters[selected, :],\
+        return n_kept, theta[selected, :],\
                 corrected_noisy_fluxes[selected, :], corrected_flux_sigmas[selected, :]
 
     def generate_catalog(
