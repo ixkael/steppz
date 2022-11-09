@@ -10,26 +10,27 @@ tfk = tf.keras
 tfkl = tf.keras.layers
 
 class NeuralSplineFlow1D(tf.Module):
-    
-    def __init__(self, n_spline_bins=32, n_conditional=1, n_hidden=[10, 10], activation=tf.tanh, base_loc=0., base_scale=0.25, spline_min=-1., spline_range=2., optimizer=tf.keras.optimizers.Adam(lr=1e-3), kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=1e-5, seed=None), restore=False, restore_filename=None):
-        
+
+    def __init__(self, n_spline_bins=32, n_conditional=1, n_hidden=[10, 10], conditional_shift=None, conditional_scale=None, output_shift=None, output_scale=None, activation=tf.tanh, base_loc=0., base_scale=0.25, spline_min=-1., spline_range=2., optimizer=tf.keras.optimizers.Adam(lr=1e-3), kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=1e-5, seed=None), restore=False, restore_filename=None):
+
 
         # restore?
         if restore:
-        	n_spline_bins, n_conditional, n_hidden, activation, base_loc, base_scale, spline_min, spline_range, optimizer, kernel_initializer, loaded_trainable_variables = pickle.load(open(restore_filename, 'rb'))
+        	n_spline_bins, n_conditional, n_hidden, activation, conditional_shift, conditional_scale, output_shift, output_scale, base_loc, base_scale, spline_min, spline_range, loaded_trainable_variables = pickle.load(open(restore_filename, 'rb'))
 
         # spline bins
         self._n_spline_bins = n_spline_bins
-        
+
         # conditional dimensions
         self._n_conditional = n_conditional
-        
+
         # hidden units and activation function
         self._architecture = [n_conditional] + n_hidden
         self._activation = activation
-        
+
         # loc and scale for the (normal) base density, spline set-up
         self._base_loc = base_loc
+        self._n_hidden = n_hidden
         self._base_scale = base_scale
         self._spline_min = spline_min
         self._spline_range = spline_range
@@ -37,11 +38,30 @@ class NeuralSplineFlow1D(tf.Module):
         # optimizer and initializer
         self.optimizer = optimizer
         self.kernel_initializer = kernel_initializer
-        
+
+
+        # shift and scale
+        self.conditional_shift = tf.convert_to_tensor(conditional_shift, dtype=tf.float32) if conditional_shift is not None else tf.zeros(self._n_conditional, dtype=tf.float32)
+        self.conditional_scale = tf.convert_to_tensor(conditional_scale, dtype=tf.float32) if conditional_scale is not None else tf.ones(self._n_conditional, dtype=tf.float32)
+        self.output_shift = tf.convert_to_tensor(output_shift, dtype=tf.float32) if output_shift is not None else tf.zeros(1, dtype=tf.float32)
+        self.output_scale = tf.convert_to_tensor(output_scale, dtype=tf.float32) if output_scale is not None else tf.ones(1, dtype=tf.float32)
+
         # networks parameterizing bin widths, heights and knot slopes
-        self._bin_widths = tfk.Sequential([tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer) for i in range(len(n_hidden))] + [tfkl.Dense(self._n_spline_bins, kernel_initializer=self.kernel_initializer)] + [tfkl.Lambda(lambda x: tf.math.softmax(x, axis=-1) * (self._spline_range - self._n_spline_bins * 1e-2) + 1e-2)])
-        self._bin_heights = tfk.Sequential([tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer) for i in range(len(n_hidden))] + [tfkl.Dense(self._n_spline_bins, kernel_initializer=self.kernel_initializer)] + [tfkl.Lambda(lambda x: tf.math.softmax(x, axis=-1) * (self._spline_range - self._n_spline_bins * 1e-2) + 1e-2)])
-        self._knot_slopes = tfk.Sequential([tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer) for i in range(len(n_hidden))] + [tfkl.Dense(self._n_spline_bins - 1, kernel_initializer=self.kernel_initializer)] + [tfkl.Lambda(lambda x: tf.math.softplus(x) + 1e-2)])
+        self._bin_widths = tfk.Sequential([
+            tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer)
+            for i in range(len(self._n_hidden))] + [tfkl.Dense(self._n_spline_bins, kernel_initializer=self.kernel_initializer)]
+            + [tfkl.Lambda(lambda x: tf.math.softmax(x, axis=-1) * (self._spline_range - self._n_spline_bins * 1e-2) + 1e-2)
+            ])
+        self._bin_heights = tfk.Sequential([
+            tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer)
+            for i in range(len(self._n_hidden))] + [tfkl.Dense(self._n_spline_bins, kernel_initializer=self.kernel_initializer)]
+            + [tfkl.Lambda(lambda x: tf.math.softmax(x, axis=-1) * (self._spline_range - self._n_spline_bins * 1e-2) + 1e-2)
+            ])
+        self._knot_slopes = tfk.Sequential([
+            tfkl.Dense(self._architecture[i+1], activation=self._activation, kernel_initializer=self.kernel_initializer)
+            for i in range(len(self._n_hidden))] + [tfkl.Dense(self._n_spline_bins - 1, kernel_initializer=self.kernel_initializer)]
+            + [tfkl.Lambda(lambda x: tf.math.softplus(x) + 1e-2)
+            ])
 
         # call to initialize trainable variables
         _ = self.__call__(tf.zeros((1, self._n_conditional)))
@@ -54,7 +74,7 @@ class NeuralSplineFlow1D(tf.Module):
 
     # construct spline bijector given inputs x
     def spline(self, x):
-   
+
         return tfb.RationalQuadraticSpline(
             bin_widths=self._bin_widths(x),
             bin_heights=self._bin_heights(x),
@@ -63,31 +83,31 @@ class NeuralSplineFlow1D(tf.Module):
 
     # construct transformed distribution given conditional inputs x
     def __call__(self, x):
-        
+
         return tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=self.spline(x))
 
     # log probability for inputs y and conditionals x, ie., P(y | x)
-    #@tf.function
-    def log_prob(self, y, x):
+    @tf.function
+    def log_prob(self, x, conditional):
 
     	# construct spline
-        rqspline = tfb.RationalQuadraticSpline(
-            bin_widths=self._bin_widths(x),
-            bin_heights=self._bin_heights(x),
-            knot_slopes=self._knot_slopes(x),
-            range_min=self._spline_min)
+        rqspline = self.spline((conditional - self.conditional_shift)/self.conditional_scale)
 
         # construct distribution
         distribution = tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=rqspline)
-        
-        return distribution.log_prob(y)
+
+        return distribution.log_prob((x - self.output_shift)/self.output_scale)
 
     # loss
     @tf.function
     def loss(self, y, x):
-        
+
         return -tf.reduce_mean(self.log_prob(y, x))
-    
+
+    def sample(self, n, conditional):
+
+        return self.__call__((conditional - self.conditional_shift)/self.conditional_scale).sample(n) * self.output_scale + self.output_shift
+
     # training step
     @tf.function
     def training_step(self, y, x):
@@ -149,10 +169,14 @@ class NeuralSplineFlow1D(tf.Module):
                 if early_stopping_counter >= patience:
                     break
         return training_loss, validation_loss
-    
+
     # save and restore
     def save(self, filename):
-        pickle.dump([self._n_spline_bins, self._n_conditional, self._n_hidden, self._activation, self._base_loc, self._base_scale, self._spline_min, self._spline_range, self.optimizer, self.kernel_initializer] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
+        pickle.dump(
+        [self._n_spline_bins, self._n_conditional, self._n_hidden,
+         self._activation, self.conditional_shift, self.conditional_scale, self.output_shift, self.output_scale, self._base_loc, self._base_scale,
+         self._spline_min, self._spline_range] +
+         [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
 
 
 class MixtureDensityNetwork(tfd.Distribution):
@@ -431,9 +455,9 @@ class MixtureDensityNetworkDiag(tfd.Distribution):
 
 
 class AutoregressiveNeuralSplineFlow(tf.Module):
-    
+
     def __init__(self, n_bins=32, n_dimensions=3, n_conditional=3, n_hidden=[10, 10], activation=tf.tanh, base_loc=0., base_scale=0.25, restore=False, restore_filename=None):
-        
+
         # set up variables...
 
         # load parameters if restoring saved model
@@ -442,15 +466,15 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
 
         # spline bins
         self._n_bins = n_bins
-        
+
         # density and conditional dimensions
         self._n_dimensions = n_dimensions
         self._n_conditional = n_conditional
-        
+
         # hidden units and activation function
         self._n_hidden = n_hidden
         self._activation = activation
-        
+
         # loc and scale for the (normal) base density
         self._base_loc = base_loc
         self._base_scale = base_scale
@@ -458,54 +482,54 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
         # construct the model...
 
         # conditional autoregressive network parameterizing the bin widths
-        self._bin_widths_ = tfb.AutoregressiveNetwork(params=self._n_bins, 
-                                                     event_shape=self._n_dimensions, 
-                                                     conditional=True, 
+        self._bin_widths_ = tfb.AutoregressiveNetwork(params=self._n_bins,
+                                                     event_shape=self._n_dimensions,
+                                                     conditional=True,
                                                      conditional_event_shape=self._n_conditional,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
 
         # conditional autoregressive network parameterizing the bin heights
-        self._bin_heights_ = tfb.AutoregressiveNetwork(params=self._n_bins, 
-                                                     event_shape=self._n_dimensions, 
-                                                     conditional=True, 
+        self._bin_heights_ = tfb.AutoregressiveNetwork(params=self._n_bins,
+                                                     event_shape=self._n_dimensions,
+                                                     conditional=True,
                                                      conditional_event_shape=self._n_conditional,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
-        
+
         # conditional autoregressive network parameterizing the slopes
-        self._knot_slopes_ = tfb.AutoregressiveNetwork(params=self._n_bins-1, 
-                                                     event_shape=self._n_dimensions, 
-                                                     conditional=True, 
+        self._knot_slopes_ = tfb.AutoregressiveNetwork(params=self._n_bins-1,
+                                                     event_shape=self._n_dimensions,
+                                                     conditional=True,
                                                      conditional_event_shape=self._n_conditional,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
-        
+
         # call to initialize trainable variables
         _ = self.__call__(tf.zeros((1, self._n_dimensions)), tf.zeros((1, self._n_conditional)))
-        
+
         if restore:
 			      for model_variable, loaded_variable in zip(self.trainable_variables, loaded_trainable_variables):
 				        model_variable.assign(loaded_variable)
 
     # softmax the bin widths
     def bin_widths(self, x, y):
-        
+
         return tf.math.softmax(self._bin_widths_(x, conditional_input=y), axis=-1) * (2 - self._n_bins * 1e-2) + 1e-2
-    
+
     # softmax the bin heights
     def bin_heights(self, x, y):
-        
+
         return tf.math.softmax(self._bin_heights_(x, conditional_input=y), axis=-1) * (2 - self._n_bins * 1e-2) + 1e-2
 
     # softplus the knot slopes
     def knot_slopes(self, x, y):
-        
+
         return tf.math.softplus(self._knot_slopes_(x, conditional_input=y)) + 1e-2
 
     # construct spline bijector given inputs x and conditional inputs y
     def spline(self, x, y):
-   
+
         return tfb.RationalQuadraticSpline(
             bin_widths=self.bin_widths(x, y),
             bin_heights=self.bin_heights(x, y),
@@ -513,27 +537,93 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
 
     # construct transformed distribution given inputs x and conditional inputs y
     def __call__(self, x, y):
-        
+
         return tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=self.spline(x, y))
-    
+
     @tf.function
     def log_prob(self, x, y):
-        
-        distribution_ = tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=tfb.RationalQuadraticSpline(bin_widths=self.bin_widths(x, y), bin_heights=self.bin_heights(x, y), knot_slopes=self.knot_slopes(x, y)))
-        
+
+        distribution_ = tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=self.spline(x, y))
+
         return tf.math.reduce_sum(distribution_.log_prob(x), axis=-1)
+
+    # loss
+    @tf.function
+    def loss(self, y, x):
+
+        return -tf.reduce_mean(self.log_prob(y, x))
 
     # save and restore
     def save(self, filename):
 
 		    pickle.dump([self._n_bins, self._n_dimensions, self._n_conditional, self._base_loc, self._base_scale, self._n_hidden, self._activation] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
 
+    # training step
+    @tf.function
+    def training_step(self, y, x):
+        with tf.GradientTape() as tape:
+            loss = self.loss(y, x)
+            gradients = tape.gradient(loss, self.trainable_variables)
+
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        return loss
+
+    # fit
+    def fit(self, data, validation_split=0.1, epochs=1000, batch_size=128, patience=20, progress_bar=True, save=False, filename=None):
+
+        # training data
+        inputs, outputs = data
+
+        # split into validation and training sub-sets
+        n_validation = int(inputs.shape[0] * validation_split)
+        n_training = inputs.shape[0] - n_validation
+        training = tf.random.shuffle([True] * n_training + [False] * n_validation)
+        training_inputs = inputs[training]
+        training_outputs = outputs[training]
+        validation_inputs = inputs[~training]
+        validation_outputs = outputs[~training]
+
+        # create iterable dataset (given batch size)
+        training_data = tf.data.Dataset.from_tensor_slices((training_inputs, training_outputs)).shuffle(n_training).batch(batch_size)
+
+        # set up training loss
+        training_loss = [np.infty]
+        validation_loss = [np.infty]
+        best_loss = np.infty
+        early_stopping_counter = 0
+
+        with trange(epochs) as t:
+            for epoch in t:
+
+                # loop over batches for a single epoch
+                for inputs_, outputs_ in training_data:
+                    loss = self.training_step(inputs_, outputs_)
+                    t.set_postfix(ordered_dict={'training loss':loss.numpy(), 'validation_loss':validation_loss[-1]}, refresh=True)
+
+                # compute total loss and validation loss
+                validation_loss.append(self.loss(validation_inputs, validation_outputs).numpy())
+                training_loss.append(loss.numpy())
+
+                # update progress bar
+                t.set_postfix(ordered_dict={'training loss':loss.numpy(), 'validation_loss':validation_loss[-1]}, refresh=True)
+
+                # early stopping condition
+                if validation_loss[-1] < best_loss:
+                    best_loss = validation_loss[-1]
+                    early_stopping_counter = 0
+                    if save:
+                        self.save(filename)
+                else:
+                    early_stopping_counter += 1
+                if early_stopping_counter >= patience:
+                    break
+        return training_loss, validation_loss
 
 
 class BinomialNetwork(tf.Module):
-    
+
     def __init__(self, n_inputs=18, n_hidden=[10, 10], activation=tf.tanh, optimizer=tf.keras.optimizers.Adam(lr=1e-3), kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=1e-5, seed=None), restore=False, restore_filename=None, epsilon=1e-24):
-        
+
         # set up variables...
 
         # load parameters if restoring saved model
@@ -550,7 +640,7 @@ class BinomialNetwork(tf.Module):
         self.optimizer = optimizer
         self.kernel_initializer = kernel_initializer
         self.epsilon = epsilon
-        
+
         # model
         self.model = tf.keras.models.Sequential([tf.keras.layers.Dense(self.architecture[layer+1],
                                                                   input_shape=(self.architecture[layer],),
@@ -560,7 +650,7 @@ class BinomialNetwork(tf.Module):
 
         # call to initialize trainable variables
         _ = self.__call__(tf.zeros((1, self.n_inputs)))
-        
+
         # restore trainable variables if needed
         if restore:
             for model_variable, loaded_variable in zip(self.trainable_variables, loaded_trainable_variables):
@@ -569,16 +659,16 @@ class BinomialNetwork(tf.Module):
     # call model (log_prob)
     @tf.function
     def __call__(self, x):
-        
+
         return self.model(x)
 
     # loss
     @tf.function
     def loss(self, inputs, selected):
-        
+
         p = tf.squeeze(self.__call__(inputs), -1)
         return - tf.reduce_mean(selected * tf.math.log(p + self.epsilon) + (1 - selected) * tf.math.log(1 - p + self.epsilon))
-    
+
     # training step
     @tf.function
     def training_step(self, inputs, selected):
@@ -640,16 +730,16 @@ class BinomialNetwork(tf.Module):
                 if early_stopping_counter >= patience:
                     break
         return training_loss, validation_loss
-    
+
     # save and restore
     def save(self, filename):
         pickle.dump([self.n_inputs, self.n_hidden, self.activation] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
 
 
 # class RegressionNetwork(tf.Module):
-    
+
 #     def __init__(self, n_inputs=18, n_outputs=1, n_hidden=[10, 10], activations=[tf.tanh, tf.tanh], optimizer=tf.keras.optimizers.Adam(lr=1e-3), kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=1e-5, seed=None), restore=False, restore_filename=None, epsilon=1e-24):
-        
+
 #         # set up variables...
 
 #         # load parameters if restoring saved model
@@ -666,7 +756,7 @@ class BinomialNetwork(tf.Module):
 #         self.optimizer = optimizer
 #         self.kernel_initializer = kernel_initializer
 #         self.epsilon = epsilon
-        
+
 #         # model
 #         self.model = tf.keras.models.Sequential([tf.keras.layers.Dense(self.architecture[layer+1],
 #                                                                   input_shape=(self.architecture[layer],),
@@ -676,7 +766,7 @@ class BinomialNetwork(tf.Module):
 
 #         # call to initialize trainable variables
 #         _ = self.__call__(tf.zeros((1, self.n_inputs)))
-        
+
 #         # restore trainable variables if needed
 #         if restore:
 #             for model_variable, loaded_variable in zip(self.trainable_variables, loaded_trainable_variables):
@@ -685,15 +775,15 @@ class BinomialNetwork(tf.Module):
 #     # call model (log_prob)
 #     @tf.function
 #     def __call__(self, x):
-        
+
 #         return self.model(x)
 
 #     # loss
 #     @tf.function
 #     def loss(self, inputs, outputs):
-        
+
 #         return tf.reduce_mean(tf.square(tf.subtract(outputs, self.__call__(inputs))))
-    
+
 #     # training step
 #     @tf.function
 #     def training_step(self, inputs, outputs):
@@ -755,16 +845,16 @@ class BinomialNetwork(tf.Module):
 #                 if early_stopping_counter >= patience:
 #                     break
 #         return training_loss, validation_loss
-    
+
 #     # save and restore
 #     def save(self, filename):
 #         pickle.dump([self.n_inputs, self.n_outputs, self.n_hidden, self.activations] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
 
 
 class RegressionNetwork(tf.Module):
-    
+
     def __init__(self, n_inputs=18, n_outputs=1, n_hidden=[10, 10], activations=[tf.tanh, tf.tanh], optimizer=tf.keras.optimizers.Adam(lr=1e-3), stddev=1e-5, restore=False, restore_filename=None, epsilon=1e-24):
-        
+
         # set up variables...
 
         # load parameters if restoring saved model
@@ -791,7 +881,7 @@ class RegressionNetwork(tf.Module):
 
         # call to initialize trainable variables
         _ = self.__call__(tf.zeros((1, self.n_inputs)))
-        
+
         # restore trainable variables if needed
         if restore:
             for model_variable, loaded_variable in zip(self.trainable_variables, loaded_trainable_variables):
@@ -800,7 +890,7 @@ class RegressionNetwork(tf.Module):
     # call model (log_prob)
     #@tf.function
     def __call__(self, x):
-    	
+
     	outputs = [x]
     	for i in range(self.n_layers):
 
@@ -813,9 +903,9 @@ class RegressionNetwork(tf.Module):
     # loss
     #@tf.function
     def loss(self, inputs, outputs):
-        
+
         return tf.reduce_mean(tf.square(tf.subtract(outputs, self.__call__(inputs))))
-    
+
     # training step
     #@tf.function
     def training_step(self, inputs, outputs):
@@ -877,7 +967,7 @@ class RegressionNetwork(tf.Module):
                 if early_stopping_counter >= patience:
                     break
         return training_loss, validation_loss
-    
+
     # save and restore
     def save(self, filename):
         pickle.dump([self.n_inputs, self.n_outputs, self.n_hidden, self.activations] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
