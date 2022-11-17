@@ -40,7 +40,7 @@ class CatalogSimulator:
             latentparameters_phi[-1, self.n_walkers:2*self.n_walkers, :]
         ]
 
-        theta = sps_prior.bijector.forward(latentparameters_phi)
+        theta = self.sps_prior.bijector.forward(latentparameters_phi)
         model_mags = self.flux_models.magnitudes(self.transform(theta[..., 1:]), theta[..., 0])
         # TODO: not reshape, and keep separation between walkers?
         theta = theta.numpy().reshape(-1, theta.shape[-1])
