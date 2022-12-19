@@ -454,22 +454,24 @@ class MixtureDensityNetworkDiag(tfd.Distribution):
 
 
 
+
+
 class AutoregressiveNeuralSplineFlow(tf.Module):
 
-    def __init__(self, n_bins=32, n_dimensions=3, n_conditional=3, n_hidden=[10, 10], activation=tf.tanh, base_loc=0., base_scale=0.25, restore=False, restore_filename=None):
+    def __init__(self, n_bins=32, n_dimensions=3, n_conditionals=3, n_hidden=[10, 10], conditional_shift=None, conditional_scale=None, output_shift=None, output_scale=None, activation=tf.tanh, base_loc=0., base_scale=0.25, restore=False, restore_filename=None):
 
         # set up variables...
 
         # load parameters if restoring saved model
         if restore:
-          n_bins, n_dimensions, n_conditional, base_loc, base_scale, n_hidden, activation, loaded_trainable_variables = pickle.load(open(restore_filename, 'rb'))
+          n_bins, n_dimensions, n_conditionals, base_loc, base_scale, n_hidden, activation, conditional_shift, conditional_scale, output_shift, output_scale, loaded_trainable_variables = pickle.load(open(restore_filename, 'rb'))
 
         # spline bins
         self._n_bins = n_bins
 
         # density and conditional dimensions
         self._n_dimensions = n_dimensions
-        self._n_conditional = n_conditional
+        self._n_conditionals = n_conditionals
 
         # hidden units and activation function
         self._n_hidden = n_hidden
@@ -481,11 +483,17 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
 
         # construct the model...
 
+        # shift and scale
+        self.conditional_shift = tf.convert_to_tensor(conditional_shift, dtype=tf.float32) if conditional_shift is not None else tf.zeros(self._n_conditionals, dtype=tf.float32)
+        self.conditional_scale = tf.convert_to_tensor(conditional_scale, dtype=tf.float32) if conditional_scale is not None else tf.ones(self._n_conditionals, dtype=tf.float32)
+        self.output_shift = tf.convert_to_tensor(output_shift, dtype=tf.float32) if output_shift is not None else tf.zeros(1, dtype=tf.float32)
+        self.output_scale = tf.convert_to_tensor(output_scale, dtype=tf.float32) if output_scale is not None else tf.ones(1, dtype=tf.float32)
+
         # conditional autoregressive network parameterizing the bin widths
         self._bin_widths_ = tfb.AutoregressiveNetwork(params=self._n_bins,
                                                      event_shape=self._n_dimensions,
                                                      conditional=True,
-                                                     conditional_event_shape=self._n_conditional,
+                                                     conditional_event_shape=self._n_conditionals,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
 
@@ -493,7 +501,7 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
         self._bin_heights_ = tfb.AutoregressiveNetwork(params=self._n_bins,
                                                      event_shape=self._n_dimensions,
                                                      conditional=True,
-                                                     conditional_event_shape=self._n_conditional,
+                                                     conditional_event_shape=self._n_conditionals,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
 
@@ -501,12 +509,12 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
         self._knot_slopes_ = tfb.AutoregressiveNetwork(params=self._n_bins-1,
                                                      event_shape=self._n_dimensions,
                                                      conditional=True,
-                                                     conditional_event_shape=self._n_conditional,
+                                                     conditional_event_shape=self._n_conditionals,
                                                      hidden_units=self._n_hidden,
                                                      activation=self._activation)
 
         # call to initialize trainable variables
-        _ = self.__call__(tf.zeros((1, self._n_dimensions)), tf.zeros((1, self._n_conditional)))
+        _ = self.__call__(tf.zeros((1, self._n_dimensions)), tf.zeros((1, self._n_conditionals)))
 
         if restore:
 			      for model_variable, loaded_variable in zip(self.trainable_variables, loaded_trainable_variables):
@@ -540,8 +548,16 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
 
         return tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=self.spline(x, y))
 
+    def sample(self, n, conditional):
+
+        return self.__call__((conditional - self.conditional_shift)/self.conditional_scale).sample(n) * self.output_scale + self.output_shift
+
+
     @tf.function
-    def log_prob(self, x, y):
+    def log_prob(self, output, conditional):
+
+        y = (conditional - self.conditional_shift)/self.conditional_scale
+        x = (output - self.output_shift)/self.output_scale
 
         distribution_ = tfd.TransformedDistribution(tfd.Normal(loc=self._base_loc, scale=self._base_scale), bijector=self.spline(x, y))
 
@@ -549,14 +565,17 @@ class AutoregressiveNeuralSplineFlow(tf.Module):
 
     # loss
     @tf.function
-    def loss(self, y, x):
+    def loss(self, output, conditional):
+
+        y = (conditional - self.conditional_shift)/self.conditional_scale
+        x = (output - self.output_shift)/self.output_scale
 
         return -tf.reduce_mean(self.log_prob(y, x))
 
     # save and restore
     def save(self, filename):
 
-		    pickle.dump([self._n_bins, self._n_dimensions, self._n_conditional, self._base_loc, self._base_scale, self._n_hidden, self._activation] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
+		    pickle.dump([self._n_bins, self._n_dimensions, self._n_conditionals, self._base_loc, self._base_scale, self._n_hidden, self._activation, self.conditional_shift, self.conditional_scale, self.output_shift, self.output_scale] + [tuple(variable.numpy() for variable in self.trainable_variables)], open(filename, 'wb'))
 
     # training step
     @tf.function
